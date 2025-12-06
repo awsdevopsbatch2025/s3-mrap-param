@@ -1,16 +1,20 @@
 terraform {
   required_providers {
-    # Default regional AWS provider
+    # 1. Standard AWS Provider (for S3 Buckets, IAM)
+    # Required to satisfy the root module's explicit mapping: aws = aws.dr
     aws = {
       source  = "hashicorp/aws"
       version = "~> 6.0" 
     }
-    # Global S3 control plane provider (required for aws_s3control_multi_region_access_point)
+    
+    # 2. Global S3 Control Plane Provider (for MRAP)
+    # Required for resources that need the control plane (us-east-1) region.
     control = {
       source  = "hashicorp/aws"
       version = "~> 6.0"
     }
-    # Required for the null_resource CLI workaround
+
+    # 3. Null Provider
     null = {
       source  = "hashicorp/null"
       version = "~> 3.0"
@@ -24,14 +28,13 @@ variable "mrap_control_plane_region" {
 }
 
 # ---------------------------------------------------
-# (Other resources like aws_s3_bucket, IAM roles, etc., remain here)
-# ---------------------------------------------------
-
-# ---------------------------------------------------
 # 1. DR BUCKET CREATION (Region: DR Region)
+# *** EXPLICITLY set provider = aws (maps to aws.dr) ***
 # ---------------------------------------------------
 
 resource "aws_s3_bucket" "dr" {
+  provider = aws 
+  
   bucket = var.name
   
   tags = {
@@ -41,6 +44,8 @@ resource "aws_s3_bucket" "dr" {
 }
 
 resource "aws_s3_bucket_versioning" "dr" {
+  provider = aws 
+  
   bucket = aws_s3_bucket.dr.id
   versioning_configuration {
     status = var.mirrored_versioning_status
@@ -49,6 +54,8 @@ resource "aws_s3_bucket_versioning" "dr" {
 
 
 resource "aws_s3_bucket_public_access_block" "dr" {
+  provider = aws 
+
   bucket = aws_s3_bucket.dr.id
   block_public_acls       = var.mirrored_pab_config.block_public_acls
   block_public_policy     = var.mirrored_pab_config.block_public_policy
@@ -58,9 +65,12 @@ resource "aws_s3_bucket_public_access_block" "dr" {
 
 # ---------------------------------------------------
 # 2. CRR IAM ROLE (DR -> Primary)
+# *** EXPLICITLY set provider = aws (maps to aws.dr) ***
 # ---------------------------------------------------
 
 resource "aws_iam_role" "replication_role" {
+  provider = aws 
+  
   name = var.replication_iam.role_name
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -73,6 +83,8 @@ resource "aws_iam_role" "replication_role" {
 }
 
 resource "aws_iam_policy" "replication_policy" {
+  provider = aws 
+  
   name = var.replication_iam.policy_name
   policy = jsonencode({
     Version = "2012-10-17"
@@ -111,15 +123,20 @@ resource "aws_iam_policy" "replication_policy" {
 }
 
 resource "aws_iam_role_policy_attachment" "replication_attach" {
-  role       = aws_iam_role.replication_role.name
+  provider = aws 
+
+  role      = aws_iam_role.replication_role.name
   policy_arn = aws_iam_policy.replication_policy.arn
 }
 
 # ---------------------------------------------------
 # 3. CRR CONFIGURATION (DR -> Primary, for Failback)
+# *** EXPLICITLY set provider = aws (maps to aws.dr) ***
 # ---------------------------------------------------
 
 resource "aws_s3_bucket_replication_configuration" "dr_to_primary" {
+  provider = aws 
+
   bucket = aws_s3_bucket.dr.id
   role   = aws_iam_role.replication_role.arn
   
@@ -161,6 +178,7 @@ resource "aws_s3_bucket_replication_configuration" "dr_to_primary" {
 
 # ---------------------------------------------------
 # 4. MULTI-REGION ACCESS POINT (MRAP) & TRAFFIC ROUTING
+# *** EXPLICITLY set provider = control ***
 # ---------------------------------------------------
 
 resource "aws_s3control_multi_region_access_point" "dr_mrap" {
@@ -178,7 +196,7 @@ resource "aws_s3control_multi_region_access_point" "dr_mrap" {
   }
 }
 
-# --- MRAP TRAFFIC DIAL WORKAROUND (REPLACING THE ERROR-PRONE RESOURCE) ---
+# --- MRAP TRAFFIC DIAL WORKAROUND ---
 
 # Extract primary and DR bucket data based on initial dial percentage
 locals {
@@ -187,7 +205,7 @@ locals {
 }
 
 data "aws_caller_identity" "current" {
-  provider = control # Must use the control plane provider
+  provider = control 
 }
 
 resource "null_resource" "mrap_traffic_dial" {
@@ -195,7 +213,7 @@ resource "null_resource" "mrap_traffic_dial" {
 
   # Trigger a replacement if the traffic dial percentages change
   triggers = {
-    mrap_name          = var.mrap_name
+    mrap_arn           = aws_s3control_multi_region_access_point.dr_mrap.arn 
     primary_bucket     = lookup(var.mrap_regions[0], "bucket_name", "")
     dr_bucket          = lookup(var.mrap_regions[1], "bucket_name", "")
     primary_dial       = lookup(var.mrap_regions[0], "traffic_dial_percentage", 0)
@@ -204,43 +222,38 @@ resource "null_resource" "mrap_traffic_dial" {
   }
 
   provisioner "local-exec" {
-    # Default interpreter is assumed to be 'sh' or 'bash', suitable for non-Windows environments.
-    # We are explicitly removing the Windows PowerShell interpreter here.
+    # *** FIX FOR WINDOWS: Use CMD as the interpreter. ***
+    # Note: Command substitution logic is simplified as we are using interpolated HCL strings.
+    interpreter = ["cmd", "/C"]
     
-    # NOTE: The command must use standard shell syntax (e.g., echo instead of Write-Host)
-    # and properly handle variables and multi-line commands.
     command = <<EOT
-      # Extract Account ID from ARN
-      MRAP_ARN="${aws_s3control_multi_region_access_point.dr_mrap.arn}"
-      ACCOUNT_ID=$(echo $MRAP_ARN | cut -d ':' -f 5)
-      PRIMARY_BUCKET_NAME="${lookup(var.mrap_regions[0], "bucket_name", "")}"
-      DR_BUCKET_NAME="${lookup(var.mrap_regions[1], "bucket_name", "")}"
-      PRIMARY_DIAL=${lookup(var.mrap_regions[0], "traffic_dial_percentage", 0)}
-      DR_DIAL=${lookup(var.mrap_regions[1], "traffic_dial_percentage", 0)}
-      CONTROL_REGION="${var.mrap_control_plane_region}"
+      @echo off
+      SET MRAP_ARN=%TF_VAR_mrap_arn%
+      SET ACCOUNT_ID=%TF_VAR_account_id%
 
-      # Constructing the Route Update strings
-      ROUTE_UPDATE_1="Bucket=${PRIMARY_BUCKET_NAME},TrafficDialPercentage=${PRIMARY_DIAL}"
-      ROUTE_UPDATE_2="Bucket=${DR_BUCKET_NAME},TrafficDialPercentage=${DR_DIAL}"
+      # Pass Terraform values as environment variables since string interpolation inside cmd scripts is complex
+      
+      echo Setting MRAP traffic dial via AWS CLI (CMD):
+      echo   Primary Bucket Dial: ${lookup(var.mrap_regions[0], "traffic_dial_percentage", 0)}%%
+      echo   DR Bucket Dial: ${lookup(var.mrap_regions[1], "traffic_dial_percentage", 0)}%%
 
-      echo "Setting MRAP traffic dial via AWS CLI (Bash):"
-      echo "  ${PRIMARY_BUCKET_NAME} Dial: ${PRIMARY_DIAL}%"
-      echo "  ${DR_BUCKET_NAME} Dial: ${DR_DIAL}%"
+      # The ARN extraction is complex in CMD, let's use the full ARN directly from the resource output.
+      # The MRAP ARN has the format: arn:aws:s3::ACCOUNT_ID:accesspoint/ALIAS.mrap
+      
+      REM Execute the AWS CLI command to set the routes
+      aws s3control submit-multi-region-access-point-routes ^
+        --account-id ${data.aws_caller_identity.current.account_id} ^
+        --mrap ${aws_s3control_multi_region_access_point.dr_mrap.arn} ^
+        --route-updates "Bucket=${lookup(var.mrap_regions[0], "bucket_name", "")},TrafficDialPercentage=${lookup(var.mrap_regions[0], "traffic_dial_percentage", 0)}" "Bucket=${lookup(var.mrap_regions[1], "bucket_name", "")},TrafficDialPercentage=${lookup(var.mrap_regions[1], "traffic_dial_percentage", 0)}" ^
+        --region ${var.mrap_control_plane_region}
 
-      # Execute the AWS CLI command to set the routes
-      aws s3control submit-multi-region-access-point-routes \
-        --account-id "${ACCOUNT_ID}" \
-        --mrap "${MRAP_ARN}" \
-        --route-updates "${ROUTE_UPDATE_1}" "${ROUTE_UPDATE_2}" \
-        --region "${CONTROL_REGION}"
-
-      # Check exit code
-      if [ $? -ne 0 ]; then
-        echo "Error: AWS CLI call failed to set MRAP routes."
+      REM Check exit code (Errorlevel) - AWS CLI returns 0 on success
+      IF %ERRORLEVEL% NEQ 0 (
+        echo Error: AWS CLI call failed to set MRAP routes.
         exit 1
-      fi
+      )
 
-      echo "✓ MRAP Traffic dial submission complete."
+      echo ^✓ MRAP Traffic dial submission complete.
 EOT
   }
 
